@@ -1,0 +1,19 @@
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+export const VERSION = readPackageVersion();
+function readPackageVersion() {
+    const here = dirname(fileURLToPath(import.meta.url));
+    for (const candidate of [
+        join(here, "..", "package.json"),
+        join(here, "..", "..", "package.json"),
+    ]) {
+        if (!existsSync(candidate))
+            continue;
+        const parsed = JSON.parse(readFileSync(candidate, "utf-8"));
+        if (typeof parsed.version === "string" && parsed.version.length > 0)
+            return parsed.version;
+    }
+    return "0.0.0";
+}
+//# sourceMappingURL=version.js.map

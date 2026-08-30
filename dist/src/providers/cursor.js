@@ -1,0 +1,430 @@
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { readCachedProvider } from "../cache.js";
+import { execFileText, commandExists } from "../lib/process.js";
+import { clampPercent, nowIso, retryAfterToIso } from "../lib/time.js";
+import { failedProvider, sourceNames, staleFromCache, statusFromError, successProvider, withRemaining, } from "./common.js";
+import { isCursorCliSourceSupported, readCursorCliCredentialState, } from "./cursor-cli-credential.js";
+const API_URL = "https://api2.cursor.sh";
+const API_TIMEOUT_MS = 15_000;
+const SQLITE_TIMEOUT_MS = 5_000;
+const STATE_DB = cursorStateDbPath();
+export const cursorAdapter = {
+    id: "cursor",
+    label: "Cursor",
+    fetchQuota,
+    inspectAuth,
+};
+export async function fetchQuota(options) {
+    const attempts = [];
+    let finalError;
+    let retryAfter;
+    const resolution = await resolveCredentials(options);
+    for (const state of resolution.unavailable) {
+        attempts.push({
+            source: state.source.source,
+            status: "skipped",
+            error: cursorCredentialError(state),
+            ...(state.source.credentialPresent === undefined
+                ? {}
+                : { credentialPresent: state.source.credentialPresent }),
+        });
+    }
+    if (resolution.credentials) {
+        attempts.push({ source: "api", status: "failed" });
+        try {
+            const quota = await fetchCursorUsage(resolution.credentials);
+            attempts[attempts.length - 1] = { source: "api", status: "success" };
+            return cursorSuccess(quota, attempts);
+        }
+        catch (error) {
+            finalError = errorMessage(error);
+            attempts[attempts.length - 1] = {
+                source: "api",
+                status: "failed",
+                error: finalError,
+            };
+            if (error instanceof CursorAuthError &&
+                resolution.source === "state-vscdb" &&
+                isCursorCliSourceSupported()) {
+                attempts[attempts.length - 1] = {
+                    source: "state-vscdb",
+                    status: "failed",
+                    error: finalError,
+                };
+                const cliState = await readCliCredentialState(options);
+                if (cliState.status === "available") {
+                    attempts.push({ source: "cli-keychain", status: "failed" });
+                    try {
+                        const quota = await fetchCursorUsage(cliState.credentials);
+                        attempts[attempts.length - 1] = {
+                            source: "cli-keychain",
+                            status: "success",
+                        };
+                        return cursorSuccess(quota, attempts);
+                    }
+                    catch (cliError) {
+                        finalError = errorMessage(cliError);
+                        attempts[attempts.length - 1] = {
+                            source: "cli-keychain",
+                            status: "failed",
+                            error: finalError,
+                        };
+                        if (cliError instanceof RateLimitError)
+                            retryAfter = cliError.retryAfter;
+                    }
+                }
+                else {
+                    attempts.push({
+                        source: cliState.source.source,
+                        status: "skipped",
+                        error: cursorCredentialError(cliState),
+                        ...(cliState.source.credentialPresent === undefined
+                            ? {}
+                            : { credentialPresent: cliState.source.credentialPresent }),
+                    });
+                }
+            }
+            else if (error instanceof RateLimitError) {
+                retryAfter = error.retryAfter;
+            }
+        }
+    }
+    else {
+        const primary = resolution.unavailable[0];
+        finalError = cursorFinalError(primary, cursorCredentialError(primary));
+    }
+    const cached = readCachedProvider("cursor");
+    if (cached) {
+        return staleFromCache(cached, finalError, sourceNames(attempts), attempts);
+    }
+    return failedProvider({
+        provider: "cursor",
+        label: "Cursor",
+        status: retryAfter ? "rate_limited" : statusFromError(finalError),
+        error: finalError,
+        retryAfter,
+        sourcesTried: sourceNames(attempts),
+        attempts,
+    });
+}
+export async function inspectAuth(options) {
+    const editorState = await readCredentialState();
+    const sources = [editorState.source];
+    if (isCursorCliSourceSupported()) {
+        const editorAvailable = editorState.status === "available";
+        sources.push((await readCliCredentialState(editorAvailable
+            ? { ...options, allowKeychainPrompt: false }
+            : options, editorAvailable)).source);
+    }
+    return { provider: "cursor", sources };
+}
+/**
+ * The Cursor editor and CLI keep credentials in different stores, and either
+ * source is enough. Quota fetching tries the non-prompting editor store first;
+ * it reads the CLI Keychain value only when the editor token is absent or
+ * rejected by Cursor.
+ */
+async function resolveCredentials(options) {
+    const unavailable = [];
+    const editorState = await readCredentialState();
+    if (editorState.status === "available") {
+        return {
+            credentials: editorState.credentials,
+            source: "state-vscdb",
+            unavailable,
+        };
+    }
+    unavailable.push(editorState);
+    if (!isCursorCliSourceSupported())
+        return { unavailable };
+    const cliState = await readCliCredentialState(options);
+    if (cliState.status === "available") {
+        return {
+            credentials: cliState.credentials,
+            source: "cli-keychain",
+            unavailable,
+        };
+    }
+    unavailable.push(cliState);
+    return { unavailable };
+}
+async function readCliCredentialState(options, presenceOnly = false) {
+    const state = await readCursorCliCredentialState(options, presenceOnly);
+    if (state.status !== "available")
+        return state;
+    return {
+        status: "available",
+        credentials: {
+            accessToken: state.accessToken,
+            email: state.identity.email,
+        },
+        source: state.source,
+    };
+}
+export function normalizeCursorUsage(usage, planInfo, credentials) {
+    const data = objectValue(usage);
+    if (!data)
+        return undefined;
+    const planData = objectValue(planInfo);
+    const plan = objectValue(planData?.planInfo);
+    const planName = stringValue(plan?.planName) ??
+        stringValue(plan?.price) ??
+        credentials?.membershipType;
+    const reset = parseEpochMillisOrIso(data.billingCycleEnd) ??
+        parseEpochMillisOrIso(plan?.billingCycleEnd);
+    const planUsage = objectValue(data.planUsage);
+    const windows = [];
+    const total = numberValue(planUsage?.totalPercentUsed);
+    if (total !== undefined) {
+        windows.push(withRemaining({
+            id: "included_usage",
+            label: "included usage",
+            kind: "monthly",
+            percentUsed: clampPercent(total),
+            resetsAt: reset,
+        }));
+    }
+    const auto = numberValue(planUsage?.autoPercentUsed);
+    if (auto !== undefined) {
+        windows.push(withRemaining({
+            id: "auto_usage",
+            label: "auto usage",
+            kind: "monthly",
+            percentUsed: clampPercent(auto),
+            resetsAt: reset,
+        }));
+    }
+    const api = numberValue(planUsage?.apiPercentUsed);
+    if (api !== undefined) {
+        windows.push(withRemaining({
+            id: "api_usage",
+            label: "API usage",
+            kind: "monthly",
+            percentUsed: clampPercent(api),
+            resetsAt: reset,
+        }));
+    }
+    const spend = objectValue(data.spendLimitUsage);
+    const individualLimit = numberValue(spend?.individualLimit);
+    const individualRemaining = numberValue(spend?.individualRemaining);
+    const individualUsed = numberValue(spend?.individualUsed) ??
+        (individualLimit !== undefined && individualRemaining !== undefined
+            ? individualLimit - individualRemaining
+            : undefined);
+    if (individualLimit !== undefined && individualLimit > 0) {
+        windows.push(withRemaining({
+            id: "spend_limit",
+            label: "spend limit",
+            kind: "credits",
+            percentUsed: individualUsed === undefined
+                ? undefined
+                : clampPercent((individualUsed / individualLimit) * 100),
+            spentUsd: individualUsed === undefined ? undefined : individualUsed / 100,
+            limitUsd: individualLimit / 100,
+            resetsAt: reset,
+        }));
+    }
+    if (windows.length === 0)
+        return undefined;
+    return {
+        plan: planName,
+        account: { email: credentials?.email },
+        windows,
+        refreshedAt: nowIso(),
+    };
+}
+async function fetchCursorUsage(credentials) {
+    const [usage, planInfo] = await Promise.all([
+        postDashboardRpc(credentials.accessToken, "GetCurrentPeriodUsage"),
+        postDashboardRpc(credentials.accessToken, "GetPlanInfo").catch(() => undefined),
+    ]);
+    const quota = normalizeCursorUsage(usage, planInfo, credentials);
+    if (!quota)
+        throw new Error("Cursor quota unavailable");
+    return quota;
+}
+async function postDashboardRpc(accessToken, method) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+    try {
+        const response = await fetch(`${API_URL}/aiserver.v1.DashboardService/${method}`, {
+            method: "POST",
+            headers: {
+                authorization: `Bearer ${accessToken}`,
+                accept: "application/json",
+                "content-type": "application/json",
+                "connect-protocol-version": "1",
+            },
+            body: "{}",
+            signal: controller.signal,
+        });
+        rejectUnusableUsageResponse(response);
+        return response.json();
+    }
+    finally {
+        clearTimeout(timer);
+    }
+}
+function rejectUnusableUsageResponse(response) {
+    if (response.status === 401 || response.status === 403) {
+        throw new CursorAuthError();
+    }
+    if (response.status === 429) {
+        throw new RateLimitError(retryAfterToIso(response.headers.get("retry-after")));
+    }
+    if (!response.ok)
+        throw new Error(`Cursor quota unavailable (${response.status})`);
+}
+async function readCredentialState() {
+    if (!(await commandExists("sqlite3"))) {
+        return {
+            status: "skipped",
+            source: {
+                source: "state-vscdb",
+                path: STATE_DB,
+                status: "skipped",
+                error: "sqlite3_unavailable",
+            },
+        };
+    }
+    try {
+        const accessToken = await readCursorStateValue("cursorAuth/accessToken");
+        if (!accessToken) {
+            return {
+                status: "missing",
+                source: { source: "state-vscdb", path: STATE_DB, status: "missing" },
+            };
+        }
+        const email = await readCursorStateValue("cursorAuth/cachedEmail");
+        const membershipType = await readCursorStateValue("cursorAuth/stripeMembershipType");
+        return {
+            status: "available",
+            credentials: { accessToken, email, membershipType },
+            source: { source: "state-vscdb", path: STATE_DB, status: "available" },
+        };
+    }
+    catch (error) {
+        const sqliteError = sqliteErrorMessage(error);
+        if (sqliteError === "credentials_missing") {
+            return {
+                status: "missing",
+                source: { source: "state-vscdb", path: STATE_DB, status: "missing" },
+            };
+        }
+        return {
+            status: "invalid",
+            source: {
+                source: "state-vscdb",
+                path: STATE_DB,
+                status: "invalid",
+                error: sqliteError,
+            },
+        };
+    }
+}
+async function readCursorStateValue(key) {
+    const output = await execFileText("sqlite3", [
+        "-readonly",
+        STATE_DB,
+        `select value from ItemTable where key = '${key.replace(/'/g, "''")}' limit 1;`,
+    ], SQLITE_TIMEOUT_MS);
+    const value = output.trim();
+    if (value.length === 0)
+        return undefined;
+    try {
+        const parsed = JSON.parse(value);
+        return typeof parsed === "string" && parsed.length > 0 ? parsed : undefined;
+    }
+    catch {
+        return value;
+    }
+}
+function cursorStateDbPath() {
+    if (process.env.CURSOR_STATE_DB)
+        return process.env.CURSOR_STATE_DB;
+    if (process.platform === "darwin") {
+        return join(homedir(), "Library", "Application Support", "Cursor", "User", "globalStorage", "state.vscdb");
+    }
+    if (process.platform === "win32") {
+        return join(process.env.APPDATA ?? join(homedir(), "AppData", "Roaming"), "Cursor", "User", "globalStorage", "state.vscdb");
+    }
+    return join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "Cursor", "User", "globalStorage", "state.vscdb");
+}
+function parseEpochMillisOrIso(value) {
+    const number = numberValue(value);
+    if (number !== undefined) {
+        return new Date(number > 10_000_000_000 ? number : number * 1000).toISOString();
+    }
+    if (typeof value !== "string" || value.trim() === "")
+        return undefined;
+    const parsed = Number(value);
+    if (Number.isFinite(parsed))
+        return parseEpochMillisOrIso(parsed);
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+function objectValue(value) {
+    return value && typeof value === "object"
+        ? value
+        : undefined;
+}
+function stringValue(value) {
+    return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+function numberValue(value) {
+    if (typeof value === "number" && Number.isFinite(value))
+        return value;
+    if (typeof value === "string" && value.trim() !== "") {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed))
+            return parsed;
+    }
+    return undefined;
+}
+function sqliteErrorMessage(error) {
+    const message = error instanceof Error ? error.message : "";
+    return /no such file|unable to open database/i.test(message)
+        ? "credentials_missing"
+        : "sqlite_read_error";
+}
+function cursorCredentialError(state) {
+    return state.source.error ?? `credentials_${state.status}`;
+}
+function cursorFinalError(state, error) {
+    return state.status === "missing" || error === "credentials_missing"
+        ? "Cursor sign-in required"
+        : error;
+}
+function errorMessage(error) {
+    if (error instanceof Error && error.name === "AbortError")
+        return "Cursor quota request timed out";
+    return error instanceof Error ? error.message : "Cursor quota unavailable";
+}
+function cursorSuccess(quota, attempts) {
+    return successProvider({
+        provider: "cursor",
+        label: "Cursor",
+        source: "api",
+        plan: quota.plan,
+        account: quota.account,
+        windows: quota.windows,
+        credits: quota.credits,
+        refreshedAt: quota.refreshedAt,
+        sourcesTried: sourceNames(attempts),
+        attempts,
+    });
+}
+class CursorAuthError extends Error {
+    constructor() {
+        super("Cursor sign-in required");
+    }
+}
+class RateLimitError extends Error {
+    retryAfter;
+    constructor(retryAfter) {
+        super("Cursor quota endpoint rate limited");
+        this.retryAfter = retryAfter;
+    }
+}
+//# sourceMappingURL=cursor.js.map

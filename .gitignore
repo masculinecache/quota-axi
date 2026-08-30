@@ -1,0 +1,10 @@
+node_modules
+node_modules/
+*.log
+/tmp-test/
+
+# Credential key files never belong in the repo.
+*.key
+.zai-key
+.command-code.key
+
