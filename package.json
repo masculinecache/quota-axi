@@ -1,12 +1,12 @@
 {
-  "name": "quota-axi",
+  "name": "@masculinecache/quota-axi",
   "version": "0.1.30",
   "packageManager": "pnpm@11.1.1",
   "description": "AXI CLI that reports local agent-provider quota windows without routing or mutation",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "https://github.com/kunchenguid/quota-axi.git"
+      "url": "https://github.com/masculinecache/quota-axi.git"
   },
   "keywords": [
     "quota",
@@ -52,7 +52,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test:dist": "node --test tests/*.test.mjs",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run test:dist"
   },
   "license": "MIT",
   "engines": {
