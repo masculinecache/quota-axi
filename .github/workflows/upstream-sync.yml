@@ -21,10 +21,6 @@ on:
     - cron: "17 3 * * *"
   workflow_dispatch:
 
-permissions:
-  contents: write
-  pull-requests: write
-
 concurrency:
   group: upstream-sync
   cancel-in-progress: false
@@ -38,6 +34,14 @@ env:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    # Job-scoped, least-privilege: this job pushes the sync branch, opens or
+    # updates the sync PR, and squash-merges it on green - contents and
+    # pull-requests write. The repo's default workflow permissions stay
+    # read-only; PR creation additionally requires the repo setting
+    # "Allow GitHub Actions to create and approve pull requests".
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
         with:
