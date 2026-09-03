@@ -1,0 +1,7 @@
+# Repo environment pin (guard mitigation, captain order 2026-09-02).
+# Every shell entering this repo through the fleet's mise tool layer uses the
+# masculinecache GitHub identity only - never an ambient/global account.
+
+[env]
+GH_REPO = "masculinecache/quota-axi"
+GH_CONFIG_DIR = "$HOME/.config/gh-masculinecache"

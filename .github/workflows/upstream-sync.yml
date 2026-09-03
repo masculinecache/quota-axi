@@ -1,0 +1,210 @@
+name: upstream-sync
+
+# Keeps masculinecache/quota-axi current with upstream kunchenguid/quota-axi
+# (default branch: main). Cadence: daily — upstream ships fixes and releases
+# near-daily. No-op: when the upstream HEAD matches
+# .github/upstream-sync-state.json the job exits green without creating a
+# branch or PR. The first run (state "none") performs the initial upstream
+# source sync.
+#
+# What lands: the merge brings upstream's source tree into this repo for
+# tracking while the fork's committed dist/ (its hand-maintained build) stays
+# authoritative — this workflow validates, it does not rebuild dist or bump
+# the version. Upstream's CI/no-mistakes/release-please machinery is pruned
+# and fork-owned files are pinned to their HEAD state.
+#
+# Secrets (VALUES set by the repo owner, NAMES only here): an absent secret
+# makes that provider's smoke check a visible SKIP, never a red run.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/kunchenguid/quota-axi.git
+  UPSTREAM_BRANCH: main
+  SYNC_BRANCH: sync/upstream
+  STATE_FILE: .github/upstream-sync-state.json
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect upstream changes
+        id: detect
+        run: |
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch --quiet upstream "$UPSTREAM_BRANCH"
+          SHA="$(git rev-parse "upstream/$UPSTREAM_BRANCH")"
+          LAST="$(node -p "const fs=require('fs');try{JSON.parse(fs.readFileSync(process.env.STATE_FILE,'utf8')).upstream}catch{return ''}")"
+          VERSION="$(git show "upstream/$UPSTREAM_BRANCH":package.json | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")"
+          {
+            echo "upstream_sha=$SHA"
+            echo "upstream_short=${SHA:0:8}"
+            echo "upstream_version=$VERSION"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$SHA" = "$LAST" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "upstream HEAD unchanged since last sync ($SHA); no-op"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "upstream moved: ${LAST:-never-synced} -> $SHA (v$VERSION)"
+          fi
+
+      - name: Merge upstream into the sync branch
+        if: steps.detect.outputs.changed == 'true'
+        run: |
+          git config user.name "quota-axi-sync[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$SYNC_BRANCH" origin/master
+          # Unrelated histories on the first sync; -X ours keeps fork-owned
+          # files on conflicting hunks while upstream-only files land.
+          if ! git merge --no-edit -X ours --allow-unrelated-histories "upstream/$UPSTREAM_BRANCH"; then
+            echo "::error::merge produced conflicts beyond the scripted -X ours resolution; manual sync required"
+            exit 1
+          fi
+          # Pin fork-owned files to their pre-merge state.
+          git checkout HEAD -- README.md package.json .gitignore AGENTS.md CLAUDE.md LICENSE skills/ 2>/dev/null || true
+          # Upstream CI/no-mistakes/release machinery must never run here.
+          for f in .github/workflows/*; do
+            case "$(basename "$f")" in
+              ci.yml|upstream-sync.yml) ;;
+              *) git rm -q "$f" ;;
+            esac
+          done
+          git rm -rq .airlock .no-mistakes 2>/dev/null || true
+          git rm -q release-please-config.json .release-please-manifest.json 2>/dev/null || true
+
+      - name: Record synced upstream HEAD
+        if: steps.detect.outputs.changed == 'true'
+        env:
+          UPSTREAM_SHA: ${{ steps.detect.outputs.upstream_sha }}
+          UPSTREAM_VERSION: ${{ steps.detect.outputs.upstream_version }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const state = {
+              upstream: process.argv[1],
+              upstreamVersion: process.argv[2],
+              syncedAt: new Date().toISOString(),
+            };
+            fs.writeFileSync(process.env.STATE_FILE, JSON.stringify(state, null, 2) + "\n");
+          ' "$UPSTREAM_SHA" "$UPSTREAM_VERSION"
+
+      - name: Commit and push the sync branch
+        if: steps.detect.outputs.changed == 'true'
+        env:
+          UPSTREAM_SHORT: ${{ steps.detect.outputs.upstream_short }}
+          UPSTREAM_VERSION: ${{ steps.detect.outputs.upstream_version }}
+        run: |
+          git add -A
+          git commit -m "chore(sync): merge upstream kunchenguid/quota-axi ${UPSTREAM_SHORT} (v${UPSTREAM_VERSION})"
+          git push --force origin "$SYNC_BRANCH"
+
+      - name: Open or update the sync PR
+        if: steps.detect.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHORT: ${{ steps.detect.outputs.upstream_short }}
+          UPSTREAM_VERSION: ${{ steps.detect.outputs.upstream_version }}
+          UPSTREAM_SHA: ${{ steps.detect.outputs.upstream_sha }}
+        run: |
+          cat > pr-body.md <<'EOF'
+          Keeps this fork current with upstream [kunchenguid/quota-axi](https://github.com/kunchenguid/quota-axi).
+
+          - upstream HEAD: ${UPSTREAM_SHA} (v${UPSTREAM_VERSION})
+          - upstream source tree merged in for tracking; the fork's committed `dist/` stays the hand-maintained build (not rebuilt, no version bump)
+          - upstream CI/no-mistakes/release-please machinery pruned; fork-owned files pinned to HEAD
+          - fork-only provider surface gated live: opencode, opencode-go, commandcode, zai, openrouter, phoenixgrove
+
+          Validation results are posted below before the auto-merge decision.
+          Auto-merge: when the node test suite passes and no smoke check FAILs
+          (SKIPs excluded), this PR squash-merges to master automatically; any
+          red leaves it open with the failure visible.
+
+          Smoke secret names (values are GitHub Actions secrets, set by the repo
+          owner; an absent secret SKIPs that provider, never fails the run):
+
+          | secret name | provider check |
+          | --- | --- |
+          | OPENCODE_API_KEY | GET opencode.ai/zen/go/v1/usage |
+          | OPENCODE_GO_API_KEY | GET opencode.ai/zen/go/v1/usage |
+          | COMMAND_CODE_API_KEY | GET api.commandcode.ai/alpha/whoami |
+          | ZAI_API_KEY | GET api.z.ai/api/monitor/usage/quota/limit (bigmodel.cn fallback) |
+          | OPENROUTER_API_KEY | GET openrouter.ai/api/v1/key |
+          | PHOENIXGROVE_API_KEY | GET api.pgsgrove.com/v1/usage (parseable percentages) |
+          EOF
+          sed -i "s/\${UPSTREAM_SHA}/$UPSTREAM_SHA/g; s/\${UPSTREAM_VERSION}/$UPSTREAM_VERSION/g; s/\${UPSTREAM_SHORT}/$UPSTREAM_SHORT/g" pr-body.md
+          STATE="$(gh pr view "$SYNC_BRANCH" --json state -q .state 2>/dev/null || true)"
+          if [ "$STATE" = "OPEN" ]; then
+            echo "open sync PR found; branch force-push updated it in place"
+          else
+            gh pr create --base master --head "$SYNC_BRANCH" \
+              --title "chore(sync): merge upstream kunchenguid/quota-axi ${UPSTREAM_SHORT} (v${UPSTREAM_VERSION})" \
+              --body-file pr-body.md
+          fi
+
+      - name: Node test suite
+        if: steps.detect.outputs.changed == 'true'
+        id: tests
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          node --test tests/*.test.mjs 2>&1 | tee test-output.txt
+
+      - name: Provider smoke checks
+        if: steps.detect.outputs.changed == 'true'
+        id: smoke
+        continue-on-error: true
+        run: node scripts/upstream-sync/smoke.mjs --summary-file smoke-summary.md
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE_GO_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
+          COMMAND_CODE_API_KEY: ${{ secrets.COMMAND_CODE_API_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PHOENIXGROVE_API_KEY: ${{ secrets.PHOENIXGROVE_API_KEY }}
+
+      - name: Update PR with results and merge on green
+        if: steps.detect.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            cat pr-body.md
+            echo
+            echo "### Node test suite"
+            echo
+            if [ "${{ steps.tests.outcome }}" = "success" ]; then
+              echo "**GREEN**"
+            else
+              echo "**RED** — failing tests:"
+              echo
+              echo '```'
+              grep -E "^(not ok|# (tests|pass|fail))" test-output.txt | head -20 || true
+              echo '```'
+            fi
+            echo
+            cat smoke-summary.md
+          } > pr-final.md
+          gh pr edit "$SYNC_BRANCH" --body-file pr-final.md
+          if [ "${{ steps.tests.outcome }}" = "success" ] && [ "${{ steps.smoke.outcome }}" = "success" ]; then
+            echo "all checks green (SKIPs excluded); squash-merging to master"
+            gh pr merge "$SYNC_BRANCH" --squash --delete-branch
+          else
+            echo "::error::sync checks failed; PR left open with the failure visible"
+            exit 1
+          fi

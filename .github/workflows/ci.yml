@@ -1,0 +1,31 @@
+name: ci
+
+# Build-free test check: the fork ships committed dist/ (no src/), and the
+# node --test suite imports only dist modules and node builtins, so no
+# dependency install is needed. This keeps the check fast and immune to
+# lockfile drift from upstream syncs.
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Node test suite
+        run: node --test tests/*.test.mjs
