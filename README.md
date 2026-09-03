@@ -18,6 +18,10 @@ Vendor dashboards are not shaped for shell automation, and local CLIs expose dif
 quota-axi reports local Claude, Codex, Cursor, GitHub Copilot, Grok, and Kimi quota windows in one [AXI](https://axi.md)-shaped call.
 It is data only: it never routes, recommends a provider, model, harness, credential, or route, proxies, intercepts, logs in, imports browser cookies, or mutates provider state. Default output has no ordering preference. The opt-in `models --sort runway` surface applies only its documented deterministic comparator to quota evidence, preserves all evidence and explicit ties, and is not a recommendation.
 
+> **Fork notice:** upstream: <https://github.com/kunchenguid/quota-axi>; this org mirror adds provider coverage and stays synced.
+> The original CLI, its providers, and its design are the work of [kunchenguid](https://github.com/kunchenguid) and upstream contributors, published under MIT.
+> This mirror ([@masculinecache/quota-axi](https://github.com/masculinecache/quota-axi)) adds Command Code, OpenRouter, and Phoenix Grove coverage on top, and a scheduled [upstream-sync workflow](.github/workflows/upstream-sync.yml) keeps it current with upstream.
+
 - **Official sources** - quota-axi reads local provider auth sources and calls the first-party quota, usage, billing, or entitlement endpoints used by the local agents, with a read-only Codex app-server probe as fallback.
 - **Local first** - quota and auth reports run on the machine that holds the credentials; their network calls go to first-party provider endpoints, never a third-party relay.
   The separate `update` command contacts npm only when the user runs it.
