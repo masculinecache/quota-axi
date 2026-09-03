@@ -21,10 +21,6 @@ on:
     - cron: "17 3 * * *"
   workflow_dispatch:
 
-permissions:
-  contents: write
-  pull-requests: write
-
 concurrency:
   group: upstream-sync
   cancel-in-progress: false
@@ -38,6 +34,14 @@ env:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    # Job-scoped, least-privilege: this job pushes the sync branch, opens or
+    # updates the sync PR, and squash-merges it on green - contents and
+    # pull-requests write. The repo's default workflow permissions stay
+    # read-only; PR creation additionally requires the repo setting
+    # "Allow GitHub Actions to create and approve pull requests".
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -148,13 +152,22 @@ jobs:
           | PHOENIXGROVE_API_KEY | GET api.pgsgrove.com/v1/usage (parseable percentages) |
           EOF
           sed -i "s/\${UPSTREAM_SHA}/$UPSTREAM_SHA/g; s/\${UPSTREAM_VERSION}/$UPSTREAM_VERSION/g; s/\${UPSTREAM_SHORT}/$UPSTREAM_SHORT/g" pr-body.md
-          STATE="$(gh pr view "$SYNC_BRANCH" --json state -q .state 2>/dev/null || true)"
+          # REST only: the GraphQL createPullRequest mutation refuses the
+          # Actions integration token in this repo even with
+          # pull-requests:write, so the whole PR lifecycle goes through
+          # gh api (REST), which honors the job-scoped token permissions.
+          REPO="$GITHUB_REPOSITORY"
+          OWNER="${REPO%%/*}"
+          STATE="$(gh api "repos/$REPO/pulls?head=$OWNER:$SYNC_BRANCH&state=open" -q '.[0].state // ""' 2>/dev/null || true)"
           if [ "$STATE" = "OPEN" ]; then
             echo "open sync PR found; branch force-push updated it in place"
           else
-            gh pr create --base master --head "$SYNC_BRANCH" \
-              --title "chore(sync): merge upstream kunchenguid/quota-axi ${UPSTREAM_SHORT} (v${UPSTREAM_VERSION})" \
-              --body-file pr-body.md
+            gh api -X POST "repos/$REPO/pulls" \
+              -f title="chore(sync): merge upstream kunchenguid/quota-axi ${UPSTREAM_SHORT} (v${UPSTREAM_VERSION})" \
+              -f head="$SYNC_BRANCH" \
+              -f base="master" \
+              -f body="$(cat pr-body.md)" \
+              -q '.html_url'
           fi
 
       - name: Node test suite
@@ -182,6 +195,8 @@ jobs:
         if: steps.detect.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHORT: ${{ steps.detect.outputs.upstream_short }}
+          UPSTREAM_VERSION: ${{ steps.detect.outputs.upstream_version }}
         run: |
           {
             cat pr-body.md
@@ -200,10 +215,23 @@ jobs:
             echo
             cat smoke-summary.md
           } > pr-final.md
-          gh pr edit "$SYNC_BRANCH" --body-file pr-final.md
+          # REST only (see the PR-create step): find the open sync PR, patch
+          # its body, squash-merge on green, delete the sync branch.
+          REPO="$GITHUB_REPOSITORY"
+          OWNER="${REPO%%/*}"
+          NUMBER="$(gh api "repos/$REPO/pulls?head=$OWNER:$SYNC_BRANCH&state=open" -q '.[0].number // empty' 2>/dev/null || true)"
+          if [ -z "$NUMBER" ]; then
+            echo "::error::no open sync PR found for $SYNC_BRANCH"
+            exit 1
+          fi
+          gh api -X PATCH "repos/$REPO/pulls/$NUMBER" -f body="$(cat pr-final.md)" -q '.html_url'
           if [ "${{ steps.tests.outcome }}" = "success" ] && [ "${{ steps.smoke.outcome }}" = "success" ]; then
-            echo "all checks green (SKIPs excluded); squash-merging to master"
-            gh pr merge "$SYNC_BRANCH" --squash --delete-branch
+            echo "all checks green (SKIPs excluded); squash-merging PR #$NUMBER to master"
+            gh api -X PUT "repos/$REPO/pulls/$NUMBER/merge" \
+              -f merge_method="squash" \
+              -f commit_title="chore(sync): merge upstream kunchenguid/quota-axi ${UPSTREAM_SHORT} (v${UPSTREAM_VERSION}) (#$NUMBER)" \
+              -q '.sha'
+            git push origin --delete "$SYNC_BRANCH" 2>/dev/null || true
           else
             echo "::error::sync checks failed; PR left open with the failure visible"
             exit 1
