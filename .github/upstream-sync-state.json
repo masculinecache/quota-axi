@@ -1,5 +1,5 @@
 {
-  "upstream": "none",
-  "note": "seeded by the pipeline PR; the first workflow run performs the initial upstream source sync",
-  "syncedAt": "2026-09-02"
+  "upstream": "55aea4801e5aa2f78c32ebb3f8d894ca77867d4f",
+  "upstreamVersion": "0.1.36",
+  "syncedAt": "2026-09-03T14:13:09.050Z"
 }
