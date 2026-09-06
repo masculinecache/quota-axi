@@ -27,7 +27,7 @@ jobs:
         with:
           version: 11
       
-      - run: pnpm install --frozen-lockfile
+      - run: pnpm install
       - run: pnpm run build
       - run: pnpm test
       - run: pnpm publish --access public
