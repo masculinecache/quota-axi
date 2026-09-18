@@ -1,0 +1,14 @@
+reviews:
+  profile: "assertive"
+  path_filters:
+    - "!**/node_modules/**"
+    - "!**/dist/**"
+    - "!**/*.lock"
+    - "!**/package-lock.json"
+  path_instructions:
+    - path: "**/*"
+      instructions: |
+        Focus on API authentication and quota window parsing.
+        Check provider detection logic handles edge cases.
+        Verify credential handling doesn't leak keys in output.
+        Flag hardcoded provider assumptions that limit extensibility.
