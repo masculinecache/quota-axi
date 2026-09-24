@@ -1,7 +1,6 @@
 {
   "name": "@masculinecache/quota-axi",
   "version": "0.1.31",
-  "packageManager": "pnpm@11.1.1",
   "description": "AXI CLI that reports local agent-provider quota windows without routing or mutation",
   "type": "module",
   "author": "kunchenguid (upstream author, https://github.com/kunchenguid/quota-axi)",
@@ -46,15 +45,11 @@
     "access": "public",
     "provenance": true
   },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild"
-    ]
-  },
+
   "scripts": {
     "build": "tsc",
     "build:skill": "tsx scripts/build-skill.ts",
-    "test": "pnpm run build && vitest run",
+    "test": "npm run build && vitest run",
     "test:watch": "vitest",
     "dev": "tsx bin/quota-axi.ts",
     "lint": "eslint bin src test scripts",
