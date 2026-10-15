@@ -63,7 +63,7 @@
     "node": ">=22.19"
   },
   "dependencies": {
-    "@toon-format/toon": "4.1.1",
+    "@toon-format/toon": "4.4.0",
     "axi-sdk-js": "^0.1.10"
   },
   "devDependencies": {
